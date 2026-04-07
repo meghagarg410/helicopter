@@ -22,8 +22,8 @@ from datetime import datetime
 
 TARGET_URL    = "https://www.heliyatra.irctc.co.in/"
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
-MIN_INTERVAL  = int(os.getenv("MIN_INTERVAL_SECONDS", "240"))
-MAX_INTERVAL  = int(os.getenv("MAX_INTERVAL_SECONDS", "360"))
+MIN_INTERVAL  = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))
+MAX_INTERVAL  = int(os.getenv("MAX_INTERVAL_SECONDS", "90"))
 
 CLOSED_PHRASES = [
     "booking is currently closed",
