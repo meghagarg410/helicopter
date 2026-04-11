@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """
-IRCTC HeliYatra Booking Monitor (lightweight - no Playwright needed)
-Monitors https://www.heliyatra.irctc.co.in/ and sends Slack alerts
-when booking opens for Kedarnath Dham or Hemkund Sahib.
-
-Setup:
-    pip install requests beautifulsoup4
-
-Usage:
-    export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
-    python heliyatra_monitor.py
+IRCTC HeliYatra Booking Monitor - alerts on ANY text change
+Monitors https://www.heliyatra.irctc.co.in/
 """
 
 import os
@@ -24,14 +16,6 @@ TARGET_URL    = "https://www.heliyatra.irctc.co.in/"
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
 MIN_INTERVAL  = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))
 MAX_INTERVAL  = int(os.getenv("MAX_INTERVAL_SECONDS", "90"))
-
-CLOSED_PHRASES = [
-    "booking is currently closed",
-    "will be notified as soon as it reopens",
-    "booking closed",
-    "not available",
-    "coming soon",
-]
 
 DESTINATIONS = ["Shri Hemkund Sahib", "Shri Kedarnath Dham"]
 
@@ -83,44 +67,38 @@ def fetch_page() -> str | None:
     return None
 
 
-def check_booking_status(html: str) -> dict[str, bool]:
+def extract_section_text(html: str) -> dict[str, str]:
+    """Extract the text snippet for each destination section."""
     soup = BeautifulSoup(html, "html.parser")
-    status = {}
+    sections = {}
 
     for dest in DESTINATIONS:
         heading = soup.find(
             lambda tag: tag.name in ("h2", "h3", "h4", "h5", "p", "span", "div")
             and dest.lower() in tag.get_text(strip=True).lower()
         )
-
         if heading is not None:
             container = heading.find_parent(["div", "section", "article", "li"]) or heading
-            section_text = container.get_text(separator=" ", strip=True).lower()
-            closed = any(phrase in section_text for phrase in CLOSED_PHRASES)
-            status[dest] = not closed
+            sections[dest] = container.get_text(separator=" ", strip=True)
         else:
-            log.warning("No heading found for '%s' -- falling back to full-page scan.", dest)
-            full_text = soup.get_text(separator=" ", strip=True).lower()
-            if dest.lower() in full_text:
-                closed = any(phrase in full_text for phrase in CLOSED_PHRASES)
-                status[dest] = not closed
-            else:
-                log.warning("'%s' not found on page at all -- assuming closed.", dest)
-                status[dest] = False
+            # fallback: grab full page text
+            sections[dest] = soup.get_text(separator=" ", strip=True)
 
-    return status
+    return sections
 
 
-def send_slack_alert(destination: str) -> None:
+def send_slack_alert(destination: str, old_text: str, new_text: str) -> None:
     if not SLACK_WEBHOOK:
         log.error("SLACK_WEBHOOK_URL is not set!")
         return
     now = datetime.now().strftime("%d %b %Y, %I:%M %p")
     payload = {
         "text": (
-            f":helicopter: *HeliYatra Booking OPEN!*\n\n"
-            f"*{destination}* helicopter booking has just opened on IRCTC HeliYatra.\n"
-            f"Book now -> {TARGET_URL}\n\n"
+            f":helicopter: *HeliYatra Page Changed!*\n\n"
+            f"*{destination}* section just changed — booking may be opening!\n"
+            f"Check now -> {TARGET_URL}\n\n"
+            f"*Was:* {old_text[:200]}\n"
+            f"*Now:* {new_text[:200]}\n\n"
             f"_Detected at {now}_"
         )
     }
@@ -134,16 +112,17 @@ def send_slack_alert(destination: str) -> None:
         log.error("Slack alert failed: %s", exc)
 
 
-def send_startup_message() -> None:
+def send_startup_message(initial_sections: dict[str, str]) -> None:
     if not SLACK_WEBHOOK:
         return
     now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    status_lines = "\n".join(f"• *{dest}:* {text[:150]}" for dest, text in initial_sections.items())
     payload = {
         "text": (
             f":white_check_mark: *HeliYatra Monitor Started*\n"
-            f"Watching: {', '.join(DESTINATIONS)}\n"
-            f"Checking every {MIN_INTERVAL//60}-{MAX_INTERVAL//60} min\n"
-            f"_Started at {now}_"
+            f"Checking every {MIN_INTERVAL}-{MAX_INTERVAL}s — will alert on ANY text change\n"
+            f"_Started at {now}_\n\n"
+            f"*Current status:*\n{status_lines}"
         )
     }
     try:
@@ -154,45 +133,61 @@ def send_startup_message() -> None:
 
 
 def next_interval() -> float:
-    return max(60, random.uniform(MIN_INTERVAL, MAX_INTERVAL) + random.uniform(-15, 15))
+    return max(60, random.uniform(MIN_INTERVAL, MAX_INTERVAL) + random.uniform(-10, 10))
 
 
 def main() -> None:
     if not SLACK_WEBHOOK:
-        log.error("SLACK_WEBHOOK_URL is not set. Export it before running.")
+        log.error("SLACK_WEBHOOK_URL is not set.")
         raise SystemExit(1)
 
     log.info("=" * 46)
-    log.info("  IRCTC HeliYatra Monitor  (lightweight)")
+    log.info("  IRCTC HeliYatra Monitor  (change detector)")
     log.info("=" * 46)
-    log.info("URL         : %s", TARGET_URL)
-    log.info("Interval    : %d-%d s", MIN_INTERVAL, MAX_INTERVAL)
-    log.info("Destinations: %s", ", ".join(DESTINATIONS))
+    log.info("URL      : %s", TARGET_URL)
+    log.info("Interval : %d-%d s", MIN_INTERVAL, MAX_INTERVAL)
 
-    send_startup_message()
-    alerted: set[str] = set()
+    # Get initial state
+    log.info("Fetching initial page state...")
+    while True:
+        html = fetch_page()
+        if html:
+            break
+        log.warning("Could not fetch initial page, retrying in 30s...")
+        time.sleep(30)
+
+    previous_sections = extract_section_text(html)
+    for dest, text in previous_sections.items():
+        log.info("  %-35s -> %s", dest, text[:80])
+
+    send_startup_message(previous_sections)
 
     while True:
-        log.info("Checking booking status...")
+        sleep_secs = next_interval()
+        log.info("Next check in %.0f s...\n", sleep_secs)
+        time.sleep(sleep_secs)
+
+        log.info("Checking for changes...")
         html = fetch_page()
 
-        if html:
-            status = check_booking_status(html)
-            for dest, is_open in status.items():
-                log.info("  %-35s -> %s", dest, "OPEN" if is_open else "closed")
-                if is_open and dest not in alerted:
-                    log.info("  '%s' is now OPEN! Sending Slack alert...", dest)
-                    send_slack_alert(dest)
-                    alerted.add(dest)
-                elif not is_open and dest in alerted:
-                    log.info("  '%s' closed again; resetting.", dest)
-                    alerted.discard(dest)
-        else:
+        if not html:
             log.warning("Page fetch failed; will retry next cycle.")
+            continue
 
-        sleep_secs = next_interval()
-        log.info("Next check in %.0f s (%.1f min)...\n", sleep_secs, sleep_secs / 60)
-        time.sleep(sleep_secs)
+        current_sections = extract_section_text(html)
+
+        for dest in DESTINATIONS:
+            old = previous_sections.get(dest, "")
+            new = current_sections.get(dest, "")
+
+            if old != new:
+                log.info("  CHANGE DETECTED for '%s'!", dest)
+                log.info("  Was: %s", old[:100])
+                log.info("  Now: %s", new[:100])
+                send_slack_alert(dest, old, new)
+                previous_sections[dest] = new  # update baseline
+            else:
+                log.info("  %-35s -> no change", dest)
 
 
 if __name__ == "__main__":
