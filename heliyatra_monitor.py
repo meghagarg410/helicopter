@@ -5,6 +5,7 @@ Monitors https://www.heliyatra.irctc.co.in/
 """
 
 import os
+import re
 import time
 import random
 import logging
@@ -67,24 +68,54 @@ def fetch_page() -> str | None:
     return None
 
 
-def extract_section_text(html: str) -> dict[str, str]:
-    """Extract the text snippet for each destination section."""
+def extract_status_texts(html: str) -> dict[str, str | None]:
+    """
+    Extract booking status text for each destination.
+
+    The site is Next.js SSR. The status text appears in two places:
+    1. As visible HTML in <p class="mb-2 mt-0 text-xl leading-7"> tags
+    2. As __html values inside <script> JSON blobs (dangerouslySetInnerHTML)
+
+    We try method 1 first (most reliable), then fall back to regex on raw HTML.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    sections = {}
+    results = {}
 
     for dest in DESTINATIONS:
-        heading = soup.find(
-            lambda tag: tag.name in ("h2", "h3", "h4", "h5", "p", "span", "div")
-            and dest.lower() in tag.get_text(strip=True).lower()
-        )
-        if heading is not None:
-            container = heading.find_parent(["div", "section", "article", "li"]) or heading
-            sections[dest] = container.get_text(separator=" ", strip=True)
-        else:
-            # fallback: grab full page text
-            sections[dest] = soup.get_text(separator=" ", strip=True)
+        found = None
 
-    return sections
+        # Method 1: Find the h3 heading for this destination,
+        # then grab the <p> status text in the same card
+        heading = soup.find("h3", string=lambda s: s and dest in s)
+        if heading:
+            card = heading.find_parent("div", class_=lambda c: c and "rounded-lg" in c)
+            if card:
+                # The status paragraph is the first <p> inside the content div
+                p = card.find("p", class_=lambda c: c and "text-xl" in c)
+                if p:
+                    found = p.get_text(strip=True)
+
+        # Method 2: Regex fallback — grab __html value right after dest name in script JSON
+        if not found:
+            # Look for the destination name followed shortly by __html":"..."
+            pattern = re.compile(
+                re.escape(dest) + r'.{0,500}?"__html"\s*:\s*"([^"]+)"',
+                re.DOTALL
+            )
+            match = pattern.search(html)
+            if match:
+                raw = match.group(1)
+                # Unescape \u003c etc and strip HTML tags
+                raw = raw.encode().decode("unicode_escape")
+                raw = re.sub(r"<[^>]+>", "", raw)
+                found = raw.strip()
+
+        if found and len(found) > 5:
+            results[dest] = found
+        else:
+            results[dest] = None  # couldn't extract
+
+    return results
 
 
 def send_slack_alert(destination: str, old_text: str, new_text: str) -> None:
@@ -95,10 +126,10 @@ def send_slack_alert(destination: str, old_text: str, new_text: str) -> None:
     payload = {
         "text": (
             f":helicopter: *HeliYatra Page Changed!*\n\n"
-            f"*{destination}* section just changed — booking may be opening!\n"
-            f"Check now -> {TARGET_URL}\n\n"
-            f"*Was:* {old_text[:200]}\n"
-            f"*Now:* {new_text[:200]}\n\n"
+            f"*{destination}* section just changed!\n"
+            f"Check now \u2192 {TARGET_URL}\n\n"
+            f"*Was:* {old_text[:300]}\n"
+            f"*Now:* {new_text[:300]}\n\n"
             f"_Detected at {now}_"
         )
     }
@@ -112,15 +143,18 @@ def send_slack_alert(destination: str, old_text: str, new_text: str) -> None:
         log.error("Slack alert failed: %s", exc)
 
 
-def send_startup_message(initial_sections: dict[str, str]) -> None:
+def send_startup_message(initial_sections: dict) -> None:
     if not SLACK_WEBHOOK:
         return
     now = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    status_lines = "\n".join(f"• *{dest}:* {text[:150]}" for dest, text in initial_sections.items())
+    status_lines = "\n".join(
+        f"• *{dest}:* {text[:200] if text else '(could not read)'}"
+        for dest, text in initial_sections.items()
+    )
     payload = {
         "text": (
             f":white_check_mark: *HeliYatra Monitor Started*\n"
-            f"Checking every {MIN_INTERVAL}-{MAX_INTERVAL}s — will alert on ANY text change\n"
+            f"Checking every {MIN_INTERVAL}-{MAX_INTERVAL}s \u2014 alerting on ANY text change\n"
             f"_Started at {now}_\n\n"
             f"*Current status:*\n{status_lines}"
         )
@@ -149,16 +183,20 @@ def main() -> None:
 
     # Get initial state
     log.info("Fetching initial page state...")
-    while True:
+    previous_sections = {dest: None for dest in DESTINATIONS}
+
+    while any(v is None for v in previous_sections.values()):
         html = fetch_page()
         if html:
-            break
-        log.warning("Could not fetch initial page, retrying in 30s...")
-        time.sleep(30)
-
-    previous_sections = extract_section_text(html)
-    for dest, text in previous_sections.items():
-        log.info("  %-35s -> %s", dest, text[:80])
+            sections = extract_status_texts(html)
+            for dest, text in sections.items():
+                if text and previous_sections[dest] is None:
+                    previous_sections[dest] = text
+                    log.info("  %-35s -> %s", dest, text[:120])
+        missing = [d for d, v in previous_sections.items() if v is None]
+        if missing:
+            log.warning("Could not read status for: %s. Retrying in 15s...", missing)
+            time.sleep(15)
 
     send_startup_message(previous_sections)
 
@@ -174,20 +212,23 @@ def main() -> None:
             log.warning("Page fetch failed; will retry next cycle.")
             continue
 
-        current_sections = extract_section_text(html)
+        current_sections = extract_status_texts(html)
 
         for dest in DESTINATIONS:
-            old = previous_sections.get(dest, "")
-            new = current_sections.get(dest, "")
+            new = current_sections.get(dest)
+            if new is None:
+                log.info("  %-35s -> could not read, skipping", dest)
+                continue
 
+            old = previous_sections.get(dest, "")
             if old != new:
                 log.info("  CHANGE DETECTED for '%s'!", dest)
-                log.info("  Was: %s", old[:100])
-                log.info("  Now: %s", new[:100])
+                log.info("    Was: %s", old[:120])
+                log.info("    Now: %s", new[:120])
                 send_slack_alert(dest, old, new)
-                previous_sections[dest] = new  # update baseline
+                previous_sections[dest] = new
             else:
-                log.info("  %-35s -> no change", dest)
+                log.info("  %-35s -> no change (%s...)", dest, new[:60])
 
 
 if __name__ == "__main__":
